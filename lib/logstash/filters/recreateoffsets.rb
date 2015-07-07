@@ -29,31 +29,71 @@ class LogStash::Filters::Recreateoffsets < LogStash::Filters::Base
   public
   def register
     require 'thread_safe'
-    require 'atomic'
+    require 'metriks'
     @random_key_prefix = SecureRandom.hex
-    @offset_counter = ThreadSafe::Cache.new
+    @offset_counter = ThreadSafe::Cache.new { |h,k| h[k] = Metriks.counter( offset_key(k)) }
+    @had_events = true 
+    @last_had_events = true
   end # def register
 
   public
   def filter(event)
     return unless filter?(event) 
-    if @offset_counter[event[@offset_indicator]].nil?  
-      @offset_counter[event[@offset_indicator]] = Atomic.new(event['offset'].to_i)
+    if event["offset"].nil? || event[@offset_indicator].nil? || event["msg_len"].nil?
+      raise Exception.new("Bad log file, #{event}, #{event['offset']}")
+      return
     end
-    @offset_counter[event[@offset_indicator]].update { |v| [v, event['offset'].to_i].max } 
-    # filter_matched should go in the last line of our successful code
+    @had_events = true
+    offset_diff = (event['offset'] + event["msg_len"]) - @offset_counter[event[@offset_indicator]].count
+    if offset_diff > 0
+      @offset_counter[event[@offset_indicator]].increment(offset_diff)
+    end
   end # def filter
+
+  public
   def flush(options = {})
-    @offset_counter.each_pair do |k,v|
-      puts "#{k},#{v.value}"
-    end 
-    event = LogStash::Event.new
-    filter_matched(event)
+    if @had_events
+      puts 'had messages'
+      @last_had_events = true
+      @had_events = false
+    else
+      @last_had_events = false
+      event = LogStash::Event.new
+      event["message"] = "No msgs being recieved from input. Most likely safe to shutdown"
+      filter_matched(event)
+      puts 'no messages for a while!'
+    end
+    return
   end # flush
+  
+  public
   def periodic_flush
     true
   end # periodic_flush
-  def metric_key(key)
+
+  private
+  def offset_key(key)
     "#{@random_key_prefix}_#{key}"
   end # def metric_key 
+  
+  private
+  def write_offsets
+    open(@offset_path, 'a') do |f|
+      @offset_counter.each_pair do |path, counter|
+        f.puts "#{path}:#{counter.count}"
+      end
+    end
+  end # write_offsets
+
+  def teardown
+    if @offset_path != ""
+      if File.exist?(@offset_path)
+        File.delete(@offset_path)
+      end
+      if !@had_events && !@last_had_events
+        write_offsets
+      end
+      @offset_path = ""
+    end
+  end # def teardown
 end # class LogStash::Filters::Example
